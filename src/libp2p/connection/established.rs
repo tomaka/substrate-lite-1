@@ -190,27 +190,25 @@ where
                     // Receive a request from the remote for a new incoming substream.
                     // These requests are automatically accepted.
                     // TODO: add a limit to the number of substreams
-                    let nego =
-                        multistream_select::InProgress::new(multistream_select::Config::Listener {
-                            supported_protocols: self
-                                .inner
-                                .request_protocols
+                    let supported_protocols = self
+                        .inner
+                        .request_protocols
+                        .iter()
+                        .filter(|p| p.inbound_allowed)
+                        .map(|p| p.name.clone())
+                        .chain(
+                            self.inner
+                                .notifications_protocols
                                 .iter()
-                                .filter(|p| p.inbound_allowed)
-                                .map(|p| p.name.clone())
-                                .chain(
-                                    self.inner
-                                        .notifications_protocols
-                                        .iter()
-                                        .map(|p| p.name.clone()),
-                                )
-                                .chain(iter::once(self.inner.ping_protocol.clone()))
-                                .collect::<Vec<_>>()
-                                .into_iter(),
-                        });
+                                .map(|p| p.name.clone()),
+                        )
+                        .chain(iter::once(self.inner.ping_protocol.clone()))
+                        .collect::<Vec<_>>();
                     self.inner
                         .yamux
-                        .accept_pending_substream(Substream::InboundNegotiating(nego));
+                        .accept_pending_substream(substream::Substream::inbound(
+                            supported_protocols,
+                        ));
                     self.encryption
                         .consume_inbound_data(yamux_decode.bytes_read);
                 }
@@ -668,7 +666,7 @@ where
     ///
     pub fn write_notification_unbounded(&mut self, id: SubstreamId, notification: Vec<u8>) {
         let mut substream = self.inner.yamux.substream_by_id(id.0).unwrap();
-        if !matches!(substream.user_data(), Substream::NotificationsOut { .. }) {
+        if !substream.user_data().is_outbound_notifications_substream() {
             panic!()
         }
         substream.write(leb128::encode_usize(notification.len()).collect());
@@ -687,7 +685,7 @@ where
     // TODO: shouldn't require `&mut self`
     pub fn notification_substream_queued_bytes(&mut self, id: SubstreamId) -> usize {
         let mut substream = self.inner.yamux.substream_by_id(id.0).unwrap();
-        if !matches!(substream.user_data(), Substream::NotificationsOut { .. }) {
+        if !substream.user_data().is_outbound_notifications_substream() {
             panic!()
         }
         substream.queued_bytes()
@@ -712,6 +710,11 @@ where
     /// Passing an `Err` corresponds, on the other side, to a [`RequestError::SubstreamClosed`].
     ///
     /// Returns an error if the [`SubstreamId`] is invalid.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the [`SubstreamId`] is valid but corresponds to a substream in a different state.
+    ///
     pub fn respond_in_request(
         &mut self,
         substream_id: SubstreamId,
@@ -723,21 +726,15 @@ where
             .substream_by_id(substream_id.0)
             .ok_or(RespondInRequestError::SubstreamClosed)?;
 
-        match substream.user_data() {
-            Substream::RequestInSend => {
-                if let Ok(response) = response {
-                    substream.write(leb128::encode_usize(response.len()).collect());
-                    substream.write(response);
-                }
+        // Panics if substream is in the wrong state, as indicated by documentation.
+        substream.user_data().respond_in_request().unwrap();
 
-                // TODO: proper state transition
-                *substream.user_data() = Substream::NegotiationFailed;
-
-                substream.close();
-                Ok(())
-            }
-            _ => panic!(),
+        if let Ok(response) = response {
+            substream.write(leb128::encode_usize(response.len()).collect());
+            substream.write(response);
         }
+
+        Ok(())
     }
 }
 

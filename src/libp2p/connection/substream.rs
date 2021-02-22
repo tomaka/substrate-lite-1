@@ -29,6 +29,16 @@ use core::{
 pub struct Substream<TNow, TRqUd, TNotifUd>(SubstreamInner<TNow, TRqUd, TNotifUd>);
 
 impl<TNow, TRqUd, TNotifUd> Substream<TNow, TRqUd, TNotifUd> {
+    /// Initializes a new `Substreams` that tracks a substream opened by the remote.
+    // TODO: `Vec` overhead
+    pub fn inbound(supported_protocols: impl Into<Vec<String>>) -> Self {
+        let nego = multistream_select::InProgress::new(multistream_select::Config::Listener {
+            supported_protocols: supported_protocols.into().into_iter(),
+        });
+
+        Substream(SubstreamInner::InboundNegotiating(nego))
+    }
+
     /// Closes a notifications substream.
     ///
     /// # Panic
@@ -41,14 +51,19 @@ impl<TNow, TRqUd, TNotifUd> Substream<TNow, TRqUd, TNotifUd> {
             panic!()
         }
 
-        *self.0 = SubstreamInner::NotificationsOutClosed;
+        self.0 = SubstreamInner::NotificationsOutClosed;
     }
 
-    /// Returns the user dat associated to the substream if it is a notifications substream.
+    /// Returns `true` if the substream is an outbound notifications substream.
+    pub fn is_outbound_notifications_substream(&self) -> bool {
+        matches!(self.0, SubstreamInner::NotificationsOut { .. })
+    }
+
+    /// Returns the user data associated to the substream if it is a notifications substream.
     ///
     /// Returns `None` if the substream isn't a notifications substream.
     pub fn notifications_substream_user_data_mut(&mut self) -> Option<&mut TNotifUd> {
-        match self.0 {
+        match &mut self.0 {
             SubstreamInner::NotificationsOutNegotiating { user_data, .. } => Some(user_data),
             SubstreamInner::NotificationsOutHandshakeRecv { user_data, .. } => Some(user_data),
             SubstreamInner::NotificationsOut { user_data } => Some(user_data),
@@ -57,7 +72,25 @@ impl<TNow, TRqUd, TNotifUd> Substream<TNow, TRqUd, TNotifUd> {
         }
     }
 
-    pub fn on_reset(self) -> Option<Event<TRqUd, TNotifUd>> {
+    /// If the substream has received an inbound request and is waiting for the user to indicate
+    /// which respond to send back, transitions it to "response has been sent back".
+    ///
+    /// Returns an error if the substream is in the wrong state.
+    pub fn respond_in_request(&mut self) -> Result<(), ()> {
+        match self.0 {
+            SubstreamInner::RequestInSend => {
+                // TODO: proper state transition
+                self.0 = SubstreamInner::NegotiationFailed;
+
+                // TODO:
+                //substream.close();
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+
+    pub fn on_remote_reset(self) -> Option<Event<TRqUd, TNotifUd>> {
         match self.0 {
             SubstreamInner::InboundNegotiating(_) => None,
             SubstreamInner::NegotiationFailed => None,
