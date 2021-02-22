@@ -167,6 +167,7 @@ struct Inner<TSrc> {
     full: bool,
 
     /// List of sources. Controlled by the API user.
+    // TODO: somehow limit the size of this container, to avoid growing forever if the source continuously announces fake blocks?
     sources: sources::AllForksSources<Source<TSrc>>,
 
     /// List of blocks whose existence is known but can't be verified yet.
@@ -206,7 +207,6 @@ impl<TSrc, TBl> AllForksSync<TSrc, TBl> {
                 ),
                 pending_blocks: pending_blocks::PendingBlocks::new(pending_blocks::Config {
                     blocks_capacity: config.blocks_capacity,
-                    max_disjoint_headers: config.max_disjoint_headers,
                     max_requests_per_block: config.max_requests_per_block,
                 }),
             },
@@ -491,9 +491,6 @@ impl<TSrc, TBl> AllForksSync<TSrc, TBl> {
     /// > **Note**: This information is normally reported by the source itself. In the case of a
     /// >           a networking peer, call this when the source sent a block announce.
     ///
-    /// Must be passed the current UNIX time in order to verify that the block doesn't pretend to
-    /// come from the future.
-    ///
     /// # Panic
     ///
     /// Panics if `source_id` is invalid.
@@ -579,6 +576,8 @@ impl<TSrc, TBl> AllForksSync<TSrc, TBl> {
 
         // TODO: somehow optimize? the encoded block is normally known from it being decoded
         let scale_encoded_header = header.scale_encoding_vec();
+
+        // TODO: if pending_blocks.num_blocks() > some_max { remove uninteresting block }
 
         let mut block_access = self
             .inner
@@ -959,15 +958,18 @@ impl<TSrc, TBl> HeaderVerify<TSrc, TBl> {
                 .inner
                 .pending_blocks
                 .block_mut(to_verify_height, to_verify_hash)
-                .or_insert(()) // TODO: optimization: don't insert
+                .into_occupied()
+                .unwrap()
                 .remove_verify_success();
+            // TODO: properly cancel the requests found in `outcome`
             self.verifiable_blocks.extend(outcome.verify_next);
         } else {
             self.parent
                 .inner
                 .pending_blocks
                 .block_mut(to_verify_height, to_verify_hash)
-                .or_insert(()) // TODO: optimization: don't insert
+                .into_occupied()
+                .unwrap()
                 .remove_verify_failed();
         }
 

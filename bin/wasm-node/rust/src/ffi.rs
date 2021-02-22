@@ -22,7 +22,7 @@ use core::{
     convert::TryFrom as _,
     fmt,
     future::Future,
-    marker,
+    iter, marker,
     ops::{Add, Sub},
     pin::Pin,
     slice,
@@ -439,12 +439,16 @@ fn init(
     chain_specs_len: u32,
     database_content_ptr: u32,
     database_content_len: u32,
+    relay_chain_specs_ptr: u32,
+    relay_chain_specs_len: u32,
     max_log_level: u32,
 ) {
     let chain_specs_ptr = usize::try_from(chain_specs_ptr).unwrap();
     let chain_specs_len = usize::try_from(chain_specs_len).unwrap();
     let database_content_ptr = usize::try_from(database_content_ptr).unwrap();
     let database_content_len = usize::try_from(database_content_len).unwrap();
+    let relay_chain_specs_ptr = usize::try_from(relay_chain_specs_ptr).unwrap();
+    let relay_chain_specs_len = usize::try_from(relay_chain_specs_len).unwrap();
 
     let chain_specs: Box<[u8]> = unsafe {
         Box::from_raw(slice::from_raw_parts_mut(
@@ -467,6 +471,18 @@ fn init(
         None
     };
 
+    let relay_chain_specs = if relay_chain_specs_ptr != 0 {
+        let data: Box<[u8]> = unsafe {
+            Box::from_raw(slice::from_raw_parts_mut(
+                relay_chain_specs_ptr as *mut u8,
+                relay_chain_specs_len,
+            ))
+        };
+        Some(String::from_utf8(Vec::from(data)).expect("non-utf8 relay chain specs"))
+    } else {
+        None
+    };
+
     let max_log_level = match max_log_level {
         0 => log::LevelFilter::Off,
         1 => log::LevelFilter::Error,
@@ -477,8 +493,18 @@ fn init(
     };
 
     spawn_task(super::start_client(
-        chain_specs,
-        database_content,
+        iter::once(super::ChainConfig {
+            specification: chain_specs,
+            database_content,
+        })
+        .chain(
+            relay_chain_specs
+                .into_iter()
+                .map(|specification| super::ChainConfig {
+                    specification,
+                    database_content: None,
+                }),
+        ),
         max_log_level,
     ));
 }

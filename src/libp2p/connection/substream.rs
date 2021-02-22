@@ -197,7 +197,7 @@ impl<TNow, TRqUd, TNotifUd> Substream<TNow, TRqUd, TNotifUd> {
                                 user_data,
                             };
                         }
-                        _ => todo!(), // TODO:
+                        _err => todo!("{:?}", _err), // TODO:
                     }
                 }
                 SubstreamInner::NotificationsOutHandshakeRecv {
