@@ -40,11 +40,15 @@
 use crate::{
     executor::{self, host, vm},
     trie::calculate_root,
+    util,
 };
 
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    string::{String, ToString as _},
+    vec::Vec,
+};
 use core::{fmt, iter, slice};
-use hashbrown::{HashMap, HashSet};
+use hashbrown::{hash_map::Entry, HashMap, HashSet};
 
 /// Configuration for [`run`].
 pub struct Config<'a, TParams> {
@@ -74,13 +78,14 @@ pub struct Config<'a, TParams> {
 /// Start running the WebAssembly virtual machine.
 pub fn run(
     config: Config<impl Iterator<Item = impl AsRef<[u8]>> + Clone>,
-) -> Result<RuntimeHostVm, host::StartErr> {
+) -> Result<RuntimeHostVm, (host::StartErr, host::HostVmPrototype)> {
     Ok(Inner {
         vm: config
             .virtual_machine
             .run_vectored(config.function_to_call, config.parameter)?
             .into(),
         top_trie_changes: config.storage_top_trie_changes,
+        top_trie_transaction_revert: None,
         offchain_storage_changes: config.offchain_storage_changes,
         top_trie_root_calculation_cache: Some(
             config.top_trie_root_calculation_cache.unwrap_or_default(),
@@ -112,7 +117,7 @@ pub struct SuccessVirtualMachine(host::Finished);
 
 impl SuccessVirtualMachine {
     /// Returns the value the called function has returned.
-    pub fn value<'a>(&'a self) -> impl AsRef<[u8]> + 'a {
+    pub fn value(&'_ self) -> impl AsRef<[u8]> + '_ {
         self.0.value()
     }
 
@@ -129,8 +134,18 @@ impl fmt::Debug for SuccessVirtualMachine {
 }
 
 /// Error that can happen during the execution.
+#[derive(Debug, derive_more::Display)]
+#[display(fmt = "{}", detail)]
+pub struct Error {
+    /// Exact error that happened.
+    pub detail: ErrorDetail,
+    /// Prototype of the virtual machine that was passed through [`Config::virtual_machine`].
+    pub prototype: host::HostVmPrototype,
+}
+
+/// See [`Error::detail`].
 #[derive(Debug, Clone, derive_more::Display)]
-pub enum Error {
+pub enum ErrorDetail {
     /// Error while executing the Wasm virtual machine.
     #[display(fmt = "Error while executing Wasm VM: {}\n{:?}", error, logs)]
     WasmVm {
@@ -156,6 +171,19 @@ pub enum RuntimeHostVm {
     NextKey(NextKey),
 }
 
+impl RuntimeHostVm {
+    /// Cancels execution of the virtual machine and returns back the prototype.
+    pub fn into_prototype(self) -> host::HostVmPrototype {
+        match self {
+            RuntimeHostVm::Finished(Ok(inner)) => inner.virtual_machine.into_prototype(),
+            RuntimeHostVm::Finished(Err(inner)) => inner.prototype,
+            RuntimeHostVm::StorageGet(inner) => inner.inner.vm.into_prototype(),
+            RuntimeHostVm::PrefixKeys(inner) => inner.inner.vm.into_prototype(),
+            RuntimeHostVm::NextKey(inner) => inner.inner.vm.into_prototype(),
+        }
+    }
+}
+
 /// Loading a storage value is required in order to continue.
 #[must_use]
 pub struct StorageGet {
@@ -164,7 +192,7 @@ pub struct StorageGet {
 
 impl StorageGet {
     /// Returns the key whose value must be passed to [`StorageGet::inject_value`].
-    pub fn key<'a>(&'a self) -> impl Iterator<Item = impl AsRef<[u8]> + 'a> + 'a {
+    pub fn key(&'_ self) -> impl Iterator<Item = impl AsRef<[u8]> + '_> + '_ {
         match &self.inner.vm {
             host::HostVm::ExternalStorageGet(req) => either::Left(iter::once(either::Left(
                 either::Left(either::Left(req.key())),
@@ -271,7 +299,7 @@ pub struct PrefixKeys {
 
 impl PrefixKeys {
     /// Returns the prefix whose keys to load.
-    pub fn prefix<'a>(&'a self) -> impl AsRef<[u8]> + 'a {
+    pub fn prefix(&'_ self) -> impl AsRef<[u8]> + '_ {
         match &self.inner.vm {
             host::HostVm::ExternalStorageClearPrefix(req) => either::Left(req.prefix()),
             host::HostVm::ExternalStorageRoot { .. } => either::Right(&[]),
@@ -294,10 +322,23 @@ impl PrefixKeys {
                         .as_mut()
                         .unwrap()
                         .storage_value_update(key.as_ref(), false);
-                    self.inner
+
+                    let previous_value = self
+                        .inner
                         .top_trie_changes
                         .insert(key.as_ref().to_vec(), None);
+
+                    if let Some(top_trie_transaction_revert) =
+                        self.inner.top_trie_transaction_revert.as_mut()
+                    {
+                        if let Entry::Vacant(entry) =
+                            top_trie_transaction_revert.entry(key.as_ref().to_vec())
+                        {
+                            entry.insert(previous_value);
+                        }
+                    }
                 }
+
                 // TODO: O(n) complexity here
                 for (key, value) in self.inner.top_trie_changes.iter_mut() {
                     if !key.starts_with(req.prefix().as_ref()) {
@@ -313,6 +354,7 @@ impl PrefixKeys {
                         .storage_value_update(key, false);
                     *value = None;
                 }
+
                 self.inner.vm = req.resume();
             }
 
@@ -365,7 +407,7 @@ pub struct NextKey {
 
 impl NextKey {
     /// Returns the key whose next key must be passed back.
-    pub fn key<'a>(&'a self) -> impl AsRef<[u8]> + 'a {
+    pub fn key(&'_ self) -> impl AsRef<[u8]> + '_ {
         if let Some(key_overwrite) = &self.key_overwrite {
             return either::Left(key_overwrite);
         }
@@ -461,6 +503,14 @@ struct Inner {
     /// Pending changes to the top storage trie that this execution performs.
     top_trie_changes: HashMap<Vec<u8>, Option<Vec<u8>>, fnv::FnvBuildHasher>,
 
+    /// `Some` if and only if we're within a storage transaction. When changes are applied to
+    /// [`Inner::top_trie_changes`], the reverse operation is added here.
+    ///
+    /// When the storage transaction ends, either this hash map is entirely discarded (to commit
+    /// changes), or applied to [`Inner::top_trie_changes`] (to revert).
+    top_trie_transaction_revert:
+        Option<HashMap<Vec<u8>, Option<Option<Vec<u8>>>, fnv::FnvBuildHasher>>,
+
     /// Pending changes to the offchain storage that this execution performs.
     offchain_storage_changes: HashMap<Vec<u8>, Option<Vec<u8>>, fnv::FnvBuildHasher>,
 
@@ -482,10 +532,13 @@ impl Inner {
             match self.vm {
                 host::HostVm::ReadyToRun(r) => self.vm = r.run(),
 
-                host::HostVm::Error { error, .. } => {
-                    return RuntimeHostVm::Finished(Err(Error::WasmVm {
-                        error,
-                        logs: self.logs,
+                host::HostVm::Error { error, prototype } => {
+                    return RuntimeHostVm::Finished(Err(Error {
+                        detail: ErrorDetail::WasmVm {
+                            error,
+                            logs: self.logs,
+                        },
+                        prototype,
                     }));
                 }
 
@@ -516,10 +569,22 @@ impl Inner {
                         .as_mut()
                         .unwrap()
                         .storage_value_update(req.key().as_ref(), req.value().is_some());
-                    self.top_trie_changes.insert(
+
+                    let previous_value = self.top_trie_changes.insert(
                         req.key().as_ref().to_vec(),
                         req.value().map(|v| v.as_ref().to_vec()),
                     );
+
+                    if let Some(top_trie_transaction_revert) =
+                        self.top_trie_transaction_revert.as_mut()
+                    {
+                        if let Entry::Vacant(entry) =
+                            top_trie_transaction_revert.entry(req.key().as_ref().to_vec())
+                        {
+                            entry.insert(previous_value);
+                        }
+                    }
+
                     self.vm = req.resume();
                 }
 
@@ -533,8 +598,18 @@ impl Inner {
                     if let Some(current_value) = current_value {
                         let mut current_value = current_value.clone().unwrap_or_default();
                         append_to_storage_value(&mut current_value, req.value().as_ref());
-                        self.top_trie_changes
+                        let previous_value = self
+                            .top_trie_changes
                             .insert(req.key().as_ref().to_vec(), Some(current_value));
+                        if let Some(top_trie_transaction_revert) =
+                            self.top_trie_transaction_revert.as_mut()
+                        {
+                            if let Entry::Vacant(entry) =
+                                top_trie_transaction_revert.entry(req.key().as_ref().to_vec())
+                            {
+                                entry.insert(previous_value);
+                            }
+                        }
                         self.vm = req.resume();
                     } else {
                         self.vm = req.into();
@@ -638,14 +713,26 @@ impl Inner {
                 }
 
                 host::HostVm::StartStorageTransaction(tx) => {
+                    self.top_trie_transaction_revert = Some(Default::default());
                     self.vm = tx.resume();
                 }
 
                 host::HostVm::EndStorageTransaction { resume, rollback } => {
+                    // The inner implementation guarantees that a storage transaction can only
+                    // end if it has earlier been started.
+                    debug_assert!(self.top_trie_transaction_revert.is_some());
+
                     if rollback {
-                        todo!() // TODO:
+                        for (key, value) in self.top_trie_transaction_revert.take().unwrap() {
+                            if let Some(value) = value {
+                                let _ = self.top_trie_changes.insert(key, value);
+                            } else {
+                                let _ = self.top_trie_changes.remove(&key);
+                            }
+                        }
                     }
 
+                    self.top_trie_transaction_revert = None;
                     self.vm = resume.resume();
                 }
 
@@ -658,7 +745,10 @@ impl Inner {
                     // TODO: optimize somehow? don't create an intermediary String?
                     let message = req.to_string();
                     if self.logs.len().saturating_add(message.len()) >= 1024 * 1024 {
-                        return RuntimeHostVm::Finished(Err(Error::LogsTooLong));
+                        return RuntimeHostVm::Finished(Err(Error {
+                            detail: ErrorDetail::LogsTooLong,
+                            prototype: host::HostVm::LogEmit(req).into_prototype(),
+                        }));
                     }
 
                     self.logs.push_str(&message);
@@ -671,40 +761,35 @@ impl Inner {
 
 /// Performs the action described by [`host::HostVm::ExternalStorageAppend`] on an
 /// encoded storage value.
-// TODO: remove usage of parity_scale_codec
 fn append_to_storage_value(value: &mut Vec<u8>, to_add: &[u8]) {
-    let curr_len = match <parity_scale_codec::Compact<u64> as parity_scale_codec::Decode>::decode(
-        &mut &value[..],
-    ) {
-        Ok(l) => l,
-        Err(_) => {
-            value.clear();
-            parity_scale_codec::Encode::encode_to(&parity_scale_codec::Compact(1u64), value);
-            value.extend_from_slice(to_add);
-            return;
-        }
-    };
+    let (curr_len, curr_len_encoded_size) =
+        match util::nom_scale_compact_usize::<nom::error::Error<&[u8]>>(&value) {
+            Ok((rest, l)) => (l, value.len() - rest.len()),
+            Err(_) => {
+                value.clear();
+                value.reserve(to_add.len() + 1);
+                value.extend_from_slice(util::encode_scale_compact_usize(1).as_ref());
+                value.extend_from_slice(to_add);
+                return;
+            }
+        };
 
     // Note: we use `checked_add`, as it is possible that the storage entry erroneously starts
     // with `u64::max_value()`.
-    let new_len = match curr_len.0.checked_add(1) {
-        Some(l) => parity_scale_codec::Compact(l),
+    let new_len = match curr_len.checked_add(1) {
+        Some(l) => l,
         None => {
             value.clear();
-            parity_scale_codec::Encode::encode_to(&parity_scale_codec::Compact(1u64), value);
+            value.reserve(to_add.len() + 1);
+            value.extend_from_slice(util::encode_scale_compact_usize(1).as_ref());
             value.extend_from_slice(to_add);
             return;
         }
     };
 
-    let curr_len_encoded_size =
-        <parity_scale_codec::Compact<u64> as parity_scale_codec::CompactLen<u64>>::compact_len(
-            &curr_len.0,
-        );
-    let new_len_encoded_size =
-        <parity_scale_codec::Compact<u64> as parity_scale_codec::CompactLen<u64>>::compact_len(
-            &new_len.0,
-        );
+    let new_len_encoded = util::encode_scale_compact_usize(new_len);
+
+    let new_len_encoded_size = new_len_encoded.as_ref().len();
     debug_assert!(
         new_len_encoded_size == curr_len_encoded_size
             || new_len_encoded_size == curr_len_encoded_size + 1
@@ -714,6 +799,6 @@ fn append_to_storage_value(value: &mut Vec<u8>, to_add: &[u8]) {
         value.insert(0, 0);
     }
 
-    parity_scale_codec::Encode::encode_to(&new_len, &mut (&mut value[..new_len_encoded_size]));
+    value[..new_len_encoded_size].copy_from_slice(new_len_encoded.as_ref());
     value.extend_from_slice(to_add);
 }

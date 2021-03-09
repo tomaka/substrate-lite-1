@@ -200,7 +200,16 @@ impl NetworkService {
                 best_number: chain.best_block.0,
                 genesis_hash: chain.genesis_block_hash,
                 role: protocol::Role::Full,
-                has_grandpa_protocol: chain.has_grandpa_protocol,
+                grandpa_protocol_config: if chain.has_grandpa_protocol {
+                    // TODO: dummy values
+                    Some(service::GrandpaState {
+                        commit_finalized_height: 0,
+                        round_number: 1,
+                        set_id: 0,
+                    })
+                } else {
+                    None
+                },
             });
         }
 
@@ -214,7 +223,9 @@ impl NetworkService {
                 known_nodes,
                 listen_addresses: Vec::new(), // TODO:
                 noise_key: config.noise_key,
-                pending_api_events_buffer_size: NonZeroUsize::new(64).unwrap(),
+                // TODO: we use an abnormally large channel in order to by pass https://github.com/paritytech/smoldot/issues/615
+                // once the issue is solved, this should be restored to a smaller value, such as 64
+                pending_api_events_buffer_size: NonZeroUsize::new(2048).unwrap(),
                 randomness_seed: rand::random(),
             }),
         });

@@ -449,12 +449,15 @@ impl<T> VerifyContext<T> {
                     },
                 }
             }
-            verify::header_body::Verify::Finished(Err(error)) => BodyVerifyStep2::Error {
-                chain: NonFinalizedTree {
-                    inner: Some(self.chain),
-                },
-                error,
-            },
+            verify::header_body::Verify::Finished(Err((error, parent_runtime))) => {
+                BodyVerifyStep2::Error {
+                    chain: NonFinalizedTree {
+                        inner: Some(self.chain),
+                    },
+                    error,
+                    parent_runtime,
+                }
+            }
             verify::header_body::Verify::StorageGet(inner) => {
                 BodyVerifyStep2::StorageGet(StorageGet {
                     context: self,
@@ -694,6 +697,8 @@ pub enum BodyVerifyStep2<T> {
         chain: NonFinalizedTree<T>,
         /// Error that happened during the verification.
         error: verify::header_body::Error, // TODO: BodyVerifyError, or rename the error to be common
+        /// Value that was passed to [`BodyVerifyRuntimeRequired::resume`].
+        parent_runtime: host::HostVmPrototype,
     },
     /// Loading a storage value is required in order to continue.
     StorageGet(StorageGet<T>),
@@ -717,7 +722,7 @@ pub struct StorageGet<T> {
 
 impl<T> StorageGet<T> {
     /// Returns the key whose value must be passed to [`StorageGet::inject_value`].
-    pub fn key<'b>(&'b self) -> impl Iterator<Item = impl AsRef<[u8]> + 'b> + 'b {
+    pub fn key(&'_ self) -> impl Iterator<Item = impl AsRef<[u8]> + '_> + '_ {
         self.inner.key()
     }
 
@@ -783,7 +788,7 @@ pub struct StoragePrefixKeys<T> {
 
 impl<T> StoragePrefixKeys<T> {
     /// Returns the prefix whose keys to load.
-    pub fn prefix<'a>(&'a self) -> impl AsRef<[u8]> + 'a {
+    pub fn prefix(&'_ self) -> impl AsRef<[u8]> + '_ {
         self.inner.prefix()
     }
 
@@ -839,7 +844,7 @@ pub struct StorageNextKey<T> {
 
 impl<T> StorageNextKey<T> {
     /// Returns the key whose next key must be passed back.
-    pub fn key<'a>(&'a self) -> impl AsRef<[u8]> + 'a {
+    pub fn key(&'_ self) -> impl AsRef<[u8]> + '_ {
         self.inner.key()
     }
 
